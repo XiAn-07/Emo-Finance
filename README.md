@@ -1,7 +1,5 @@
 # 👾 Emo-Finance (情绪记账) | 基于大模型的个人行为财务分析终端
 
-[![Deploy with Vercel](https://vercelbutton.com/api/button.svg)](你的Vercel链接)
-
 ## 📖 项目简介
 Emo-Finance 是一款将 **行为金融学** 与 **LLM 智能体(Agent)** 相结合的创新个人记账应用。
 它打破了传统流水账的模式，引入“劳累度”与“冲动度”等情绪指标，并通过本地数据驱动的赛博宠物（Moni）提供实时的财务心理映射，最终利用 LLM 生成深度的财务诊断与干预建议。
