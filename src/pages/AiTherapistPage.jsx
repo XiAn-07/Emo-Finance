@@ -110,6 +110,7 @@ function resolveChatCompletionsUrl(input) {
   return `${noTrail}/v1/chat/completions`
 }
 
+// 将最近 7 天的数据汇总成“概览一句话”，作为 User Prompt 的开头摘要
 function summarizeWeek(records) {
   const week = records.filter((r) => isWithinDays(r.date, 7))
   const totals = {
@@ -162,6 +163,7 @@ function summarizeWeek(records) {
   return `${parts.join('，')}。`
 }
 
+// 将最近 7 天的流水逐条打包成可读文本（包含备注），让 AI 能基于“动机”分析
 function buildWeeklyDetails(records) {
   const week = records.filter((r) => isWithinDays(r.date, 7))
   return week.slice(0, 60).map((r) => {
@@ -178,6 +180,7 @@ function buildWeeklyDetails(records) {
   })
 }
 
+// 将“预算监控 + 上月类目占比”打包成一段上下文，让 AI 能给出更可执行的建议
 function buildBudgetAndHistoryPack(records) {
   const monthKey = monthKeyFromDate(new Date())
   const { monthlyBudget } = getBudgetSettingsForMonth(monthKey)
@@ -285,31 +288,77 @@ function extractMotto(text) {
   return last ? last.slice(0, 80) : ''
 }
 
+function parseAgentSteps(text) {
+  const raw = String(text || '').trim()
+  if (!raw) return { thought: '', advice: '' }
+
+  const h1 = raw.match(/^###\s*.*Step\s*1\b.*$/im)
+  const h2 = raw.match(/^###\s*.*Step\s*2\b.*$/im)
+  const h3 = raw.match(/^###\s*.*Step\s*3\b.*$/im)
+
+  const i1 = h1?.index ?? -1
+  const i2 = h2?.index ?? -1
+  const i3 = h3?.index ?? -1
+
+  if (i3 < 0) return { thought: '', advice: raw }
+  const thoughtStart = i1 >= 0 ? i1 : i2 >= 0 ? i2 : 0
+  const thought = raw.slice(thoughtStart, i3).trim()
+  const advice = raw.slice(i3).trim()
+  return { thought, advice }
+}
+
+class ApiError extends Error {
+  constructor(message, options) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = options?.status || 0
+    this.kind = options?.kind || 'unknown'
+  }
+}
+
+// 调用 OpenAI 兼容接口（/v1/chat/completions）。
+// 增强点：超时控制、网络错误识别、HTTP 状态码透传（供 UI 做友好提示）。
 async function callOpenAICompatible({ baseUrl, apiKey, model, systemPrompt, userPrompt }) {
   const url = resolveChatCompletionsUrl(baseUrl)
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0.7,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-    }),
-  })
+  const controller = new AbortController()
+  const timeoutMs = 25000
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs)
+
+  let resp
+  try {
+    resp = await fetch(url, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        temperature: 0.7,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+      }),
+    })
+  } catch (e) {
+    if (e?.name === 'AbortError') {
+      throw new ApiError('请求超时', { kind: 'timeout', status: 0 })
+    }
+    throw new ApiError('网络请求失败', { kind: 'network', status: 0 })
+  } finally {
+    window.clearTimeout(timeoutId)
+  }
+
   const json = await resp.json().catch(() => null)
   if (!resp.ok) {
     const msg = json?.error?.message || `请求失败（HTTP ${resp.status}）`
-    throw new Error(msg)
+    throw new ApiError(msg, { kind: 'http', status: resp.status })
   }
   const text = json?.choices?.[0]?.message?.content
   if (typeof text !== 'string' || !text.trim()) {
-    throw new Error('未拿到有效的 AI 返回内容')
+    throw new ApiError('未拿到有效的 AI 返回内容', { kind: 'bad_response', status: resp.status })
   }
   return text.trim()
 }
@@ -334,11 +383,13 @@ export default function AiTherapistPage() {
 
   const [saving, setSaving] = useState(false)
   const [loading, setLoading] = useState(false)
-  const [fullText, setFullText] = useState('')
+  const [thoughtText, setThoughtText] = useState('')
+  const [adviceText, setAdviceText] = useState('')
   const [displayText, setDisplayText] = useState('')
   const [motto, setMotto] = useState('')
   const [resultTone, setResultTone] = useState('ok')
   const [toast, setToast] = useState({ open: false, type: 'success', message: '' })
+  const [loadingHint, setLoadingHint] = useState('')
   const typerRef = useRef(null)
 
   function stopTyper() {
@@ -398,10 +449,10 @@ export default function AiTherapistPage() {
   }, [])
 
   useEffect(() => {
-    if (!fullText) return
+    if (!adviceText) return
     stopTyper()
     setDisplayText('')
-    const text = fullText
+    const text = adviceText
     const start = performance.now()
     const duration = Math.min(5200, Math.max(900, text.length * 18))
     const tick = (now) => {
@@ -419,7 +470,22 @@ export default function AiTherapistPage() {
     return () => {
       stopTyper()
     }
-  }, [fullText])
+  }, [adviceText])
+
+  useEffect(() => {
+    if (!loading) {
+      setLoadingHint('')
+      return
+    }
+    const steps = ['正在读取账单数据...', '正在进行情绪建模...', '正在生成干预策略...', '即将完成...']
+    let i = 0
+    setLoadingHint(steps[i])
+    const id = window.setInterval(() => {
+      i = (i + 1) % steps.length
+      setLoadingHint(steps[i])
+    }, 1000)
+    return () => window.clearInterval(id)
+  }, [loading])
 
   const hasData = records.length > 0
 
@@ -475,7 +541,12 @@ export default function AiTherapistPage() {
       .replace(/^'+|'+$/g, '') || DEFAULT_MODEL
     const persona = settings.persona || persisted.persona || DEFAULT_PERSONA
 
-    if (!apiKey) {
+    const latestRecords = getRecords()
+    if (!latestRecords || latestRecords.length === 0) {
+      showToast({ type: 'error', message: '没有任何记账数据，先去记一笔帐吧。' })
+      return
+    }
+    if (!String(apiKey || '').trim()) {
       showToast({ type: 'error', message: '请先在上方配置 API Key（BYOK）。' })
       return
     }
@@ -487,12 +558,11 @@ export default function AiTherapistPage() {
       showToast({ type: 'error', message: '请先在上方配置 Model Name。' })
       return
     }
-    if (!hasData) {
-      showToast({ type: 'error', message: '你还没有任何记账数据，先去记一笔。' })
-      return
-    }
     setLoading(true)
-    setFullText('')
+    stopTyper()
+    setThoughtText('')
+    setAdviceText('')
+    setDisplayText('')
     setMotto('')
     try {
       setResultTone('ok')
@@ -505,21 +575,30 @@ export default function AiTherapistPage() {
         `请根据这些数值逻辑进行分析，不要看到 1 分就认为是心情不好。\n\n` +
         `增强上下文：如果用户备注里提到了‘学习’、‘报名’、‘考试’、‘兼职’等关键词，请结合这些场景进行深度分析。例如，六级报名费是投资未来的行为，即便金额再高、冲动分再低，也是非常正面的。\n\n` +
         `请结合预算监控与上月类目预判：如果某类目已消耗其推荐限额的 80%+，请给出具体的收缩建议（温和、可执行、带一点幽默但不讽刺）。\n\n` +
-        `请输出：\n` +
-        `1) 一段总体诊断（直击要害）\n` +
-        `2) 3-5 条可执行建议（越具体越好）\n` +
-        `3) 发现的情绪触发点（根据数据推断）\n` +
-        `4) 一句“本周挑战任务”\n\n` +
-        `请尽量使用 Markdown 格式排版，多用列表和加粗，让分析结果条理清晰。\n\n` +
-        `最后用一行输出：座右铭：<一句话，不超过 20 字>`
+        `请严格使用 Markdown，并严格按以下三个标题输出（标题文字必须完全一致）：\n` +
+        `### 🔍 Step 1: 行为特征提取\n` +
+        `用要点列出用户的收支结构、关键类目、冲动/劳累分布、预算节奏等“事实特征”。\n` +
+        `### 🧠 Step 2: 心理动机推理\n` +
+        `用要点给出基于备注与数据的动机推断（可以写“可能/倾向于”，避免过度武断）。\n` +
+        `### 💡 Step 3: 行动建议生成\n` +
+        `给出 3-6 条可执行建议（越具体越好），并包含 1 句“本周挑战任务”。\n\n` +
+        `最后单独一行输出：座右铭：<一句话，不超过 20 字>`
       const text = await callOpenAICompatible({ baseUrl, apiKey, model, systemPrompt, userPrompt })
-      setFullText(text)
+      const parsed = parseAgentSteps(text)
+      setThoughtText(parsed.thought)
+      setAdviceText(parsed.advice || text)
       setMotto(extractMotto(text))
       setAiMonthlyReview(monthKeyFromDate(new Date()), text)
     } catch (e) {
-      const msg = e?.message || '生成失败，请稍后再试。'
+      let msg = e?.message || '生成失败，请稍后再试。'
+      if (e?.status === 401) {
+        msg = 'API Key 无效或未授权，请检查设置'
+      } else if (e?.kind === 'timeout' || e?.kind === 'network' || (Number(e?.status || 0) >= 500 && Number(e?.status || 0) <= 599)) {
+        msg = 'AI 大脑暂时宕机，请检查网络或稍后再试'
+      }
       setResultTone('error')
-      setFullText(`请求失败：${msg}`)
+      setThoughtText('')
+      setAdviceText(`请求失败：${msg}`)
       setMotto('')
       showToast({ type: 'error', message: msg })
     } finally {
@@ -615,7 +694,9 @@ export default function AiTherapistPage() {
                       type="button"
                       onClick={() => {
                         stopTyper()
-                        setFullText('')
+                        setRawText('')
+                        setThoughtText('')
+                        setAdviceText('')
                         setDisplayText('')
                         setMotto('')
                         setResultTone('ok')
@@ -654,7 +735,9 @@ export default function AiTherapistPage() {
                   if (!ok) return
                   clearRecords()
                   stopTyper()
-                  setFullText('')
+                  setRawText('')
+                  setThoughtText('')
+                  setAdviceText('')
                   setDisplayText('')
                   setMotto('')
                   setResultTone('ok')
@@ -703,7 +786,7 @@ export default function AiTherapistPage() {
             <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">以聊天气泡风格展示</div>
           </div>
           {loading ? (
-            <div className="text-sm font-medium text-slate-500 dark:text-slate-400">生成中…</div>
+            <div className="text-sm font-medium text-slate-500 dark:text-slate-400">{loadingHint || '生成中…'}</div>
           ) : null}
         </div>
 
@@ -715,11 +798,51 @@ export default function AiTherapistPage() {
           ) : (
             <div className="flex justify-end">
               <div className="w-full max-w-3xl">
+                {thoughtText && resultTone !== 'error' ? (
+                  <details className="app-card mb-4 rounded-3xl border border-slate-200 bg-white/70 p-5 text-slate-700 shadow-sm dark:border-white/20 dark:bg-white/5 dark:text-slate-200">
+                    <summary className="cursor-pointer select-none text-sm font-semibold text-slate-900 dark:text-white">
+                      Agent 思考过程
+                    </summary>
+                    <div className="mt-3 text-sm leading-7 text-slate-600 dark:text-slate-300">
+                      <ReactMarkdown
+                        components={{
+                          h1: (props) => <h2 className="mb-2 mt-1 text-sm font-semibold text-slate-900 dark:text-white" {...props} />,
+                          h2: (props) => <h3 className="mb-2 mt-4 text-sm font-semibold text-slate-900 dark:text-white" {...props} />,
+                          h3: (props) => <h4 className="mb-2 mt-4 text-sm font-semibold text-slate-900 dark:text-white" {...props} />,
+                          p: (props) => <p className="my-2 text-slate-600 dark:text-slate-300" {...props} />,
+                          ul: (props) => <ul className="my-2 list-disc space-y-1 pl-5 text-slate-600 dark:text-slate-300" {...props} />,
+                          ol: (props) => <ol className="my-2 list-decimal space-y-1 pl-5 text-slate-600 dark:text-slate-300" {...props} />,
+                          li: (props) => <li className="leading-7" {...props} />,
+                          strong: (props) => <strong className="font-semibold text-slate-900 dark:text-white" {...props} />,
+                          a: ({ href, ...props }) => (
+                            <a href={href} target="_blank" rel="noreferrer" className="underline underline-offset-4" {...props} />
+                          ),
+                          blockquote: (props) => (
+                            <blockquote className="my-3 border-l-2 border-slate-300 pl-4 text-slate-600 dark:border-white/20 dark:text-slate-300" {...props} />
+                          ),
+                          code: ({ inline, ...props }) =>
+                            inline ? (
+                              <code className="rounded-xl bg-black/5 px-2 py-1 font-mono text-[0.85em] dark:bg-white/10" {...props} />
+                            ) : (
+                              <code className="font-mono text-[0.85em]" {...props} />
+                            ),
+                          pre: (props) => (
+                            <pre className="my-3 overflow-x-auto rounded-2xl bg-black/5 p-4 leading-6 dark:bg-white/10" {...props} />
+                          ),
+                          hr: () => <div className="my-4 h-px bg-slate-200 dark:bg-white/15" />,
+                        }}
+                      >
+                        {thoughtText}
+                      </ReactMarkdown>
+                    </div>
+                  </details>
+                ) : null}
+
                 <div
                   className={
                     resultTone === 'error'
-                      ? 'rounded-3xl bg-rose-600 px-5 py-4 text-sm leading-7 text-white shadow-soft'
-                      : 'rounded-3xl accent-bg px-5 py-4 text-sm leading-7 text-white shadow-soft'
+                      ? 'rounded-3xl bg-rose-600 px-6 py-5 text-[15px] leading-8 text-white shadow-soft'
+                      : 'rounded-3xl accent-bg px-6 py-5 text-[15px] leading-8 text-white shadow-soft'
                   }
                 >
                   <ReactMarkdown
