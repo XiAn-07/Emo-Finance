@@ -16,6 +16,7 @@ import ReactMarkdown from 'react-markdown'
 
 const DEFAULT_BASE_URL = 'https://api.deepseek.com/v1/chat/completions'
 const DEFAULT_MODEL = 'deepseek-chat'
+const TIMEOUT_MS = 25000
 
 const DEFAULT_PERSONA =
   '你是一个毒舌又专业的财务心理导师，请根据我的记账和情绪数据，用犀利幽默的语气指出我的财务漏洞。'
@@ -321,8 +322,7 @@ class ApiError extends Error {
 async function callOpenAICompatible({ baseUrl, apiKey, model, systemPrompt, userPrompt }) {
   const url = resolveChatCompletionsUrl(baseUrl)
   const controller = new AbortController()
-  const timeoutMs = 25000
-  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs)
+  const timeoutId = window.setTimeout(() => controller.abort(), TIMEOUT_MS)
 
   let resp
   try {
@@ -694,7 +694,6 @@ export default function AiTherapistPage() {
                       type="button"
                       onClick={() => {
                         stopTyper()
-                        setRawText('')
                         setThoughtText('')
                         setAdviceText('')
                         setDisplayText('')
@@ -735,7 +734,6 @@ export default function AiTherapistPage() {
                   if (!ok) return
                   clearRecords()
                   stopTyper()
-                  setRawText('')
                   setThoughtText('')
                   setAdviceText('')
                   setDisplayText('')
